@@ -1,14 +1,9 @@
 use krakenrs::ws::{
-    BookEntry, KrakenWsAPI, KrakenWsConfig 
+    KrakenWsAPI, KrakenWsConfig 
 };
 
 
 use core::f64;
-use std::{
-    thread,
-    time::{Duration},
-    collections::BTreeMap,
-};
 
 //To convert the decimal type to f64
 use rust_decimal::prelude::ToPrimitive;
@@ -170,7 +165,7 @@ fn main() {
     let mut mid_price_chg: Vec<f64> = vec![f64::NAN; 10_000_000];
     let mut position: Vec<f64> = vec![0.0; 10_000_000];
 
-    let mut tmp: Vec<f64> = vec![f64::NAN; 500];
+    let mut tmp: Vec<f64> = vec![f64::NAN; 3_000_000];
     let ticks: Vec<f64> = (0..tmp.len()).map(|i| i as f64 + 0.5).collect();
     
     let mut t = 0;
@@ -186,10 +181,10 @@ fn main() {
 
     let qty: u8 = 1;
     let max_open_orders: u8 = 20;
-    let tick_size: f64 = 0.1;
+    let tick_size: f64 = 0.5;
 
     loop {
-        //thread::sleep(Duration::from_millis(10));
+        //thread::sleep(Duration::from_millis(100));
         
         // Fetch the latest order book data
         let books = api_ws.get_all_books();
@@ -207,7 +202,7 @@ fn main() {
                     depth = depth.max(mid_price_tick - price.to_f64().unwrap_or(f64::NAN) / tick_size);
                 }
 
-                arrival_depth[t] = depth;
+                arrival_depth[t] = depth;   
             }
 
             prev_mid_price_tick = mid_price_tick;
@@ -217,11 +212,12 @@ fn main() {
             mid_price_chg[t] = mid_price_tick - prev_mid_price_tick;
 
             // Next we calculate parameters A, k and sigma every 5 seconds in a 10 minutes window
-            if t % 50 == 0 && t >= 6000 - 1 {
+            if t % 50 == 0 && t >= 6000 - 1 { 
                 tmp.fill(0.0);
-                let mut lambda = trading_intensity(&arrival_depth[t + 1 - 6000..t + 1].to_vec(), &mut tmp);
+                let mut lambda = trading_intensity(&arrival_depth[t + 1 - 6000..t].to_vec(), &mut tmp); 
+
                 // We take the last 70 values of lambda to calculate A and k
-                lambda = lambda.iter().take(70).map(|&x| x / 600.0).collect::<Vec<f64>>(); 
+                lambda = lambda.iter().take(70).map(|x| x / 600.0).collect::<Vec<f64>>();
 
                 let x = &ticks[..lambda.len()];
                 // Apply log to lambda to create y and y will be an array
