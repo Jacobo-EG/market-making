@@ -204,7 +204,7 @@ fn main() {
                 }
 
                 for (price, _) in book.ask.iter() {
-                    depth = depth.max(- mid_price_tick - price.to_f64().unwrap_or(f64::NAN) / tick_size);
+                    depth = depth.max(mid_price_tick - price.to_f64().unwrap_or(f64::NAN) / tick_size);
                 }
 
                 arrival_depth[t] = depth;
