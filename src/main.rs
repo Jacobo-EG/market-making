@@ -189,7 +189,7 @@ fn main() {
     let tick_size: f64 = 0.1;
 
     loop {
-        thread::sleep(Duration::from_millis(100));
+        //thread::sleep(Duration::from_millis(10));
         
         // Fetch the latest order book data
         let books = api_ws.get_all_books();
