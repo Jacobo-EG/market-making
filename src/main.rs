@@ -181,8 +181,8 @@ fn main() {
     let mut A: f64 = f64::NAN;
     let mut k: f64 = f64::NAN;
     let mut sigma: f64 = f64::NAN;
-    let mut gamma: f64 = 0.05;
-    let mut delta: f64 = 1.0;
+    let gamma: f64 = 0.05;
+    let delta: f64 = 1.0;
 
     let qty: u8 = 1;
     let max_open_orders: u8 = 20;
