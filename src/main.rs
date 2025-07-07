@@ -95,18 +95,18 @@ fn nanstd(slice: &[f64]) -> f64 {
 type HmacSha512 = Hmac<Sha512>;
 
 fn kraken_sign(api_path: &str, nonce: &str, post_data: &str, api_secret: &str) -> String {
-    // 1. SHA256(nonce + POST data)
+     
     let mut sha256 = Sha256::new();
     sha256.update(nonce.as_bytes());
     sha256.update(post_data.as_bytes());
     let hash = sha256.finalize();
 
-    // 2. Concatenate api_path + hash
+     
     let mut data = Vec::new();
     data.extend_from_slice(api_path.as_bytes());
     data.extend_from_slice(&hash);
 
-    // 3. HMAC-SHA512 with base64 decoded secret
+    
     let secret_decoded = general_purpose::STANDARD.decode(api_secret).unwrap();
     let mut mac = HmacSha512::new_from_slice(&secret_decoded).unwrap();
     mac.update(&data);
@@ -155,7 +155,7 @@ fn main() {
     let pairs = vec!["XBT/USD".to_string()];
 
     // Create a new Kraken WebSocket API instance
-    // This will connect to the Kraken WebSocket API and subscribe to the order book for the
+    // This will connect to the Kraken WebSocket API and subscribe to the order book for the pairs
     let ws_config = KrakenWsConfig {
         subscribe_book: pairs.clone(),
         book_depth: 100,
@@ -268,6 +268,8 @@ fn main() {
             let api_key = "";
             let api_secret = "";
             let client = reqwest::blocking::Client::new();
+
+            // TODO: Close orders which have not been executed and are not in the prices specified
 
             if position[t] < max_open_orders as f64 {
                 // Place bid order if bid price is not NaN and finite
