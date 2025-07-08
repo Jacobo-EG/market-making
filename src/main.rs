@@ -1,7 +1,4 @@
-use krakenrs::ws::{
-    KrakenWsAPI, KrakenWsConfig 
-};
-
+use krakenrs::ws::{KrakenWsAPI, KrakenWsConfig};
 
 use core::f64;
 
@@ -25,7 +22,6 @@ use std::collections::HashMap;
 
 // Function to calculate trading intensity
 fn trading_intensity(arrival_depth: &Vec<f64>, tmp: &mut Vec<f64>) -> Vec<f64> {
-
     let mut max_tick = 0;
 
     for depth in arrival_depth.iter() {
