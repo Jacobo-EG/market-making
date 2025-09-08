@@ -1,4 +1,4 @@
-use std::{env, fs, error::Error, collections::HashMap, time::{SystemTime, UNIX_EPOCH}};
+use std::{thread, env, fs, error::Error, collections::HashMap, time::{SystemTime, Duration, UNIX_EPOCH}};
 type HmacSha512 = Hmac<Sha512>;
 use krakenrs::ws::{KrakenWsAPI, KrakenWsConfig};
 use core::f64;
@@ -121,7 +121,7 @@ fn kraken_sign(api_path: &str, nonce: &str, post_data: &str, api_secret: &str) -
 }
 
 fn kraken_add_order(client: &Client, api_key: &str, api_secret: &str, pair: &str, ordertype: &str,  volume: f64, price: f64,) -> Result<String, reqwest::Error> {
-    let url = "https://api.kraken.com/0/private/AddOrder";
+    let url = "https://demo-futures.kraken.com/0/private/AddOrder";
     let api_path = "/0/private/AddOrder";
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis().to_string();
     let mut params = HashMap::new();
@@ -182,12 +182,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let api_ws = KrakenWsAPI::new(ws_config)?; 
 
     // GLFT Market Making Model deployed online using websockets (HTTP API for orders since WS is not supported for orders in demo mode)
-    let mut out = vec![f64::NAN; 10_000_000 * 5];
-    let mut arrival_depth = vec![f64::NAN; 10_000_000];
-    let mut mid_price_chg = vec![f64::NAN; 10_000_000];
-    let mut position = vec![0.0; 10_000_000];
+    // Using circular buffers - only keep 6000 elements (10 minutes of history) instead of 10M
+    const BUFFER_SIZE: usize = 6000;
+    let mut out = vec![f64::NAN; BUFFER_SIZE * 5];
+    let mut arrival_depth = vec![f64::NAN; BUFFER_SIZE];
+    let mut mid_price_chg = vec![f64::NAN; BUFFER_SIZE];
+    let mut position = vec![0.0; BUFFER_SIZE];
 
-    let mut tmp  = vec![f64::NAN; 3_000_000];
+    let mut tmp = vec![f64::NAN; 3_000_000];
     let ticks: Vec<f64> = (0..tmp.len()).map(|i| i as f64 + 0.5).collect();
     
     let mut t = 0;
@@ -206,7 +208,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let tick_size: f64 = 0.5;
 
     while t < 10_000_000 {
-        //thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
+        
+        // Calculate circular buffer index
+        let idx = t % BUFFER_SIZE;
         
         // Fetch the latest order book data
         let books = api_ws.get_all_books();
@@ -224,19 +229,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     depth = depth.max(mid_price_tick - price.to_f64().unwrap_or(f64::NAN) / tick_size);
                 }
 
-                arrival_depth[t] = depth;   
+                arrival_depth[idx] = depth;   
             }
 
             prev_mid_price_tick = mid_price_tick;
-            mid_price_tick = book.bid.iter().next().map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN)) +
-                             book.ask.iter().next().map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN)) / 2.0;
+            mid_price_tick = (book.bid.iter().next().map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN)) +
+                             book.ask.iter().next().map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN))) / 2.0;
                 
-            mid_price_chg[t] = mid_price_tick - prev_mid_price_tick;
+            mid_price_chg[idx] = mid_price_tick - prev_mid_price_tick;
 
             // Next we calculate parameters A, k and sigma every 5 seconds in a 10 minutes window
-            if t % 50 == 0 && t >= 6000 - 1 { 
+            if t % 50 == 0 && t >= BUFFER_SIZE - 1 { 
                 tmp.fill(0.0);
-                let mut lambda = trading_intensity(&arrival_depth[t + 1 - 6000..t].to_vec(), &mut tmp); 
+                
+                let mut lambda = trading_intensity(&arrival_depth, &mut tmp); 
 
                 // We take the last 70 values of lambda to calculate A and k
                 lambda = lambda.iter().take(70).map(|x| x / 600.0).collect::<Vec<f64>>();
@@ -249,11 +255,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 a = log_a.exp();
                 k = - k_;
 
-                sigma = nanstd(&mid_price_chg[t + 1 - 6000..t + 1]) * (10.0_f64.sqrt());
+                sigma = nanstd(&mid_price_chg) * (10.0_f64.sqrt());
 
-                out[t * 5 + 2] = sigma;
-                out[t * 5 + 3] = a;
-                out[t * 5 + 4] = k;
+                out[idx * 5 + 2] = sigma;
+                out[idx * 5 + 3] = a;
+                out[idx * 5 + 4] = k;
             }
             
             // Following we calculate target bid and ask price
@@ -263,39 +269,50 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let half_spread = c1 + delta / 2_f64 * c2 * sigma;
             let skew = c2 * sigma;
 
-            out[t * 5 + 0] = half_spread;
-            out[t * 5 + 1] = skew;
+            out[idx * 5 + 0] = half_spread;
+            out[idx * 5 + 1] = skew;
 
             // We use the current position to calculate the bid and ask depth
-            let bid_depth = half_spread + skew * position[t];
-            let ask_depth = half_spread - skew * position[t];
+            let bid_depth = half_spread + skew * position[idx];
+            let ask_depth = half_spread - skew * position[idx];
 
             let best_bid_tick = book.bid.iter().next().map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN) / tick_size);
             let bid_tick = (mid_price_tick - bid_depth).round();
-            let bid_price = bid_tick.min(best_bid_tick) * tick_size;
+            // We previously check since the min function takes one of them directly if the other is NaN
+            let mut bid_price = f64::NAN;
+            if bid_tick.is_normal() && best_bid_tick.is_normal(){
+                bid_price = bid_tick.min(best_bid_tick) * tick_size;
+            }
 
             let best_ask_tick = book.ask.iter().next().map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN) / tick_size);
             let ask_tick = (mid_price_tick + ask_depth).round();
-            let ask_price = ask_tick.max(best_ask_tick) * tick_size;
+            // As in the bid case, we check both are not NAN
+            let mut ask_price = f64::NAN;
+            if ask_tick.is_normal() && best_ask_tick.is_normal() {
+                ask_price = ask_tick.max(best_ask_tick) * tick_size;
+            }
 
             // We now have everything we need to place orders
             // Here we will have a bottleneck since orders are placed thorugh HTTP API
             // which is slower but we have no other option in demo mode
 
-            // Create connection to the HTTP API using krakenrs
-            let client = reqwest::blocking::Client::new();
-
             // TODO: Close orders which have not been executed and are not in the prices specified
 
-            if position[t] < max_open_orders as f64 {
+            if position[idx] < max_open_orders as f64 {
                 // Place bid order if bid price is not NaN and finite
                 if bid_price.is_normal() {
-                    let _ = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "buy", qty as f64, bid_price);
-                    position[t] += qty as f64;
+                    // Create connection to the HTTP API using krakenrs
+                    let client = reqwest::blocking::Client::new();
+                    let _ = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "buy", qty as f64, bid_price)?;
+                    
+                    position[idx] += qty as f64;
                 }
                 if ask_price.is_normal() {
-                    let _ = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "sell", qty as f64, ask_price);
-                    position[t] -= qty as f64;
+                    // Create connection to the HTTP API using krakenrs
+                    let client = reqwest::blocking::Client::new();
+                    let _ = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "sell", qty as f64, ask_price)?;
+
+                    position[idx] -= qty as f64;
                 }
             }
 
