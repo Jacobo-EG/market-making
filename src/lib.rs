@@ -167,17 +167,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         private: None,
     };
 
-    // Credentials can be provided either through a file or environment variables, if not default (hard-coded) credentials will be used 
-    let (api_key, api_secret) = if let Ok(credentials_path) = env::var("CREDENTIALS_PATH") {
-        let (api_key, api_secret) = read_credentials_from_file(&credentials_path)?;
-
-        (api_key, api_secret)
-    } else {
-        let api_key = env::var("KRAKEN_API_KEY").unwrap_or("".to_string());
-        let api_secret = env::var("KRAKEN_API_SECRET").unwrap_or("".to_string());
-
-        (api_key, api_secret)
-    };
+    // Credentials are provided through variables
+    let api_key = env::var("KRAKEN_API_KEY")?;
+    let api_secret = env::var("KRAKEN_API_SECRET")?;
 
     let api_ws = KrakenWsAPI::new(ws_config)?; 
 
