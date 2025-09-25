@@ -79,26 +79,6 @@ fn nanstd(slice: &[f64]) -> f64 {
     var.sqrt()
 }
 
-// Auxiliary funtion to read the credentials from a file
-fn read_credentials_from_file(credentials_path: &str) -> Result<(String, String), Box<dyn Error>> {
-    let contents = fs::read_to_string(credentials_path)?;
-    let mut lines = contents.lines();
-    
-    let api_key = lines
-        .next()
-        .ok_or("Missing the api_key in the first line of credentials file")?
-        .trim()
-        .to_string();
-    
-    let api_secret = lines
-        .next()
-        .ok_or("Missing the api_secret in the second line of credentials file")?
-        .trim()
-        .to_string();
-    
-    Ok((api_key, api_secret))
-}
-
 // Auxiliary functions to send the HTTP requests to the Kraken API
 fn kraken_sign(api_path: &str, nonce: &str, post_data: &str, api_secret: &str) -> String {
      
