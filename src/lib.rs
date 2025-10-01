@@ -1,13 +1,15 @@
-use std::{thread, env, fs, error::Error, collections::HashMap, time::{SystemTime, Duration, UNIX_EPOCH}};
+use std::{collections::HashMap, env, error::Error, thread, time::{Duration, SystemTime, UNIX_EPOCH}};
 type HmacSha512 = Hmac<Sha512>;
 use krakenrs::ws::{KrakenWsAPI, KrakenWsConfig};
 use core::f64;
+
+use serde::{self, Deserialize};
 
 //To convert the decimal type to f64
 use rust_decimal::prelude::ToPrimitive;
 
 // To craft the API requests
-use reqwest::{blocking::Client, header::{HeaderMap, HeaderValue}};
+use reqwest::{blocking::Client, header::{HeaderMap, HeaderValue, PROXY_AUTHENTICATE}};
 use base64::{engine::general_purpose, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha512, Digest};
@@ -17,6 +19,21 @@ use sha2::{Sha256, Sha512, Digest};
 // This type can be used for precise decimal arithmetic, especially useful in financial applications
 // However, we will trade-off precision for performance by using f64 instead
 // use rust_decimal::Decimal;
+
+#[derive(Deserialize)]
+pub struct Config {
+    pub pairs: Vec<String>,
+    pub buffer_size: usize,
+    pub a: f64,
+    pub k: f64,
+    pub sigma: f64,
+    pub gamma: f64,
+    pub delta: f64,
+    pub qty: u8,
+    pub max_open_orders: u8,
+    pub tick_size: f64,
+    pub  time_to_sleep: u64
+}
 
 // Function to calculate trading intensity
 pub fn trading_intensity<'a>(arrival_depth: &[f64], tmp: &'a mut [f64]) ->  Vec<f64> { //<'a>(arrival_depth: &[f64], tmp: &'a mut [f64]) -> &'a [f64] {
@@ -135,9 +152,9 @@ fn kraken_add_order(client: &Client, api_key: &str, api_secret: &str, pair: &str
     Ok(text)
 }
 
-pub fn run() -> Result<(), Box<dyn Error>> {
+pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // Pair to subscribe to
-    let pairs = vec!["XBT/USD".to_string()];
+    let pairs = config.pairs; // vec!["XBT/USD".to_string()];
 
     // Create a new Kraken WebSocket API instance
     // This will connect to the Kraken WebSocket API and subscribe to the order book for the pairs
@@ -155,11 +172,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     // GLFT Market Making Model deployed online using websockets (HTTP API for orders since WS is not supported for orders in demo mode)
     // Using circular buffers - only keep 6000 elements (10 minutes of history) instead of 10M
-    const BUFFER_SIZE: usize = 6000;
-    let mut out = vec![f64::NAN; BUFFER_SIZE * 5];
-    let mut arrival_depth = vec![f64::NAN; BUFFER_SIZE];
-    let mut mid_price_chg = vec![f64::NAN; BUFFER_SIZE];
-    let mut position = vec![0.0; BUFFER_SIZE];
+    let buffer_size: usize = config.buffer_size; // 6000;
+    let mut out = vec![f64::NAN; buffer_size * 5];
+    let mut arrival_depth = vec![f64::NAN; buffer_size];
+    let mut mid_price_chg = vec![f64::NAN; buffer_size];
+    let mut position = vec![0.0; buffer_size];
 
     let mut tmp = vec![f64::NAN; 3_000_000];
     let ticks: Vec<f64> = (0..tmp.len()).map(|i| i as f64 + 0.5).collect();
@@ -169,21 +186,23 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut prev_mid_price_tick: f64;
     let mut mid_price_tick = f64::NAN;
 
-    let mut a: f64 = f64::NAN;
-    let mut k: f64 = f64::NAN;
-    let mut sigma: f64 = f64::NAN;
-    let gamma: f64 = 0.05;
-    let delta: f64 = 1.0;
+    let mut a: f64 = config.a;
+    let mut k: f64 = config.k;
+    let mut sigma: f64 = config.sigma;
+    let gamma: f64 = config.gamma;
+    let delta: f64 = config.delta;
 
-    let qty: u8 = 1;
-    let max_open_orders: u8 = 20;
-    let tick_size: f64 = 0.5;
+    let qty: u8 = config.qty;
+    let max_open_orders: u8 = config.max_open_orders;
+    let tick_size: f64 = config.tick_size;
+
+    let time_to_sleep = config.time_to_sleep;
 
     while t < 10_000_000 {
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(time_to_sleep));
         
         // Calculate circular buffer index
-        let idx = t % BUFFER_SIZE;
+        let idx = t % buffer_size;
         
         // Fetch the latest order book data
         let books = api_ws.get_all_books();
@@ -211,7 +230,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             mid_price_chg[idx] = mid_price_tick - prev_mid_price_tick;
 
             // Next we calculate parameters A, k and sigma every 5 seconds in a 10 minutes window
-            if t % 50 == 0 && t >= BUFFER_SIZE - 1 { 
+            if t % 50 == 0 && t >= buffer_size - 1 { 
                 tmp.fill(0.0);
                 
                 let mut lambda = trading_intensity(&arrival_depth, &mut tmp); 
@@ -275,15 +294,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 if bid_price.is_normal() {
                     // Create connection to the HTTP API using krakenrs
                     let client = reqwest::blocking::Client::new();
-                    let _ = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "buy", qty as f64, bid_price)?;
-                    
+                    let res = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "buy", qty as f64, bid_price)?;
+                   
                     position[idx] += qty as f64;
                 }
                 if ask_price.is_normal() {
                     // Create connection to the HTTP API using krakenrs
                     let client = reqwest::blocking::Client::new();
-                    let _ = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "sell", qty as f64, ask_price)?;
-
+                    let res = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "sell", qty as f64, ask_price)?;
+                    
                     position[idx] -= qty as f64;
                 }
             }
