@@ -2,7 +2,8 @@ use std::{process, env, error::Error};
 use figment::{Figment, providers::{Format, Toml}};
 use market_making::Config;
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Reading configuration file ...");
 
@@ -13,7 +14,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Starting Market Making using GLFT model ...");
 
-    if let Err(e) = market_making::run(config) {
+    if let Err(e) = market_making::run(config).await {
         eprintln!("Application error: {e}");
         process::exit(1);
     }

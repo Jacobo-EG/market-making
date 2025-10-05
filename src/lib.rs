@@ -1,18 +1,24 @@
-use std::{collections::HashMap, env, error::Error, thread, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, env, error::Error, time::{Duration, SystemTime, UNIX_EPOCH}};
 type HmacSha512 = Hmac<Sha512>;
 use krakenrs::ws::{KrakenWsAPI, KrakenWsConfig};
 use core::f64;
 
 use serde::{self, Deserialize};
 
+use tokio::time::sleep;
+use tokio::task;
+
 //To convert the decimal type to f64
 use rust_decimal::prelude::ToPrimitive;
 
 // To craft the API requests
-use reqwest::{blocking::Client, header::{HeaderMap, HeaderValue, PROXY_AUTHENTICATE}};
+use reqwest::{Client, header::{HeaderMap, HeaderValue}};
 use base64::{engine::general_purpose, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha512, Digest};
+
+// Used to retrieve date in YYYYMMDD format to generate the crl_ord_id
+use chrono::Utc;
 
 
 // Importing the Decimal type from the rust_decimal crate
@@ -32,7 +38,7 @@ pub struct Config {
     pub qty: u8,
     pub max_open_orders: u8,
     pub tick_size: f64,
-    pub  time_to_sleep: u64
+    pub time_to_sleep: u64
 }
 
 // Function to calculate trading intensity
@@ -117,7 +123,7 @@ fn kraken_sign(api_path: &str, nonce: &str, post_data: &str, api_secret: &str) -
     general_purpose::STANDARD.encode(signature)
 }
 
-fn kraken_add_order(client: &Client, api_key: &str, api_secret: &str, pair: &str, ordertype: &str,  volume: f64, price: f64,) -> Result<String, reqwest::Error> {
+async fn kraken_add_order(client: &Client, api_key: &str, api_secret: &str, pair: &str, ordertype: &str,  volume: f64, price: f64, crl_ord_id: &str) -> Result<String, reqwest::Error> {
     let url = "https://demo-futures.kraken.com/0/private/AddOrder";
     let api_path = "/0/private/AddOrder";
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis().to_string();
@@ -132,11 +138,13 @@ fn kraken_add_order(client: &Client, api_key: &str, api_secret: &str, pair: &str
     params.insert("ordertype", "limit");
     params.insert("price", &price_);
     params.insert("volume", &volume_);
+    params.insert("crl_ord_id", crl_ord_id);
 
     let post_data = format!(
-        "nonce={}&pair={}&type={}&ordertype=limit&price={}&volume={}",
-        nonce, pair, ordertype, price_, volume_
+        "nonce={}&pair={}&type={}&ordertype=limit&price={}&volume={}&crl_ord_id={}",
+        nonce, pair, ordertype, price_, volume_, crl_ord_id
     );
+
     let api_sign = kraken_sign(api_path, &nonce, &post_data, api_secret);
 
     let mut headers = HeaderMap::new();
@@ -147,12 +155,15 @@ fn kraken_add_order(client: &Client, api_key: &str, api_secret: &str, pair: &str
         .post(url)
         .headers(headers)
         .form(&params)
-        .send()?;
-    let text = res.text()?;
+        .send()
+        .await?;
+
+    let text = res.text().await?;
+    
     Ok(text)
 }
 
-pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
+pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // Pair to subscribe to
     let pairs = config.pairs; // vec!["XBT/USD".to_string()];
 
@@ -183,6 +194,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     
     let mut t = 0;
 
+    // Number of orders filled
+    let mut num_orders: u32 = 0; 
+
     let mut prev_mid_price_tick: f64;
     let mut mid_price_tick = f64::NAN;
 
@@ -199,13 +213,13 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let time_to_sleep = config.time_to_sleep;
 
     while t < 10_000_000 {
-        thread::sleep(Duration::from_millis(time_to_sleep));
+        sleep(Duration::from_millis(time_to_sleep)).await;
         
         // Calculate circular buffer index
         let idx = t % buffer_size;
         
         // Fetch the latest order book data
-        let books = api_ws.get_all_books();
+        let books = task::spawn_blocking(move || api_ws.get_all_books()).await?;
 
         for (pair, book) in books {
 
@@ -293,17 +307,21 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 // Place bid order if bid price is not NaN and finite
                 if bid_price.is_normal() {
                     // Create connection to the HTTP API using krakenrs
-                    let client = reqwest::blocking::Client::new();
-                    let res = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "buy", qty as f64, bid_price)?;
+                    let client = reqwest::Client::new();
+                    let crl_ord_id = format!("bot_{}_{}", Utc::now().format("%Y%m%d").to_string(), format!("{:05}", num_orders));
+                    let _ = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "buy", qty as f64, bid_price, &crl_ord_id).await?;
                    
                     position[idx] += qty as f64;
+                    num_orders += 1;
                 }
                 if ask_price.is_normal() {
                     // Create connection to the HTTP API using krakenrs
-                    let client = reqwest::blocking::Client::new();
-                    let res = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "sell", qty as f64, ask_price)?;
+                    let client = reqwest::Client::new();
+                    let crl_ord_id = format!("bot_{}_{}", Utc::now().format("%Y%m%d").to_string(), format!("{:05}", num_orders));
+                    let _ = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "sell", qty as f64, ask_price, &crl_ord_id).await?;
                     
                     position[idx] -= qty as f64;
+                    num_orders += 1;
                 }
             }
 
