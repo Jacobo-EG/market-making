@@ -1,0 +1,5 @@
+array_width = 20
+attr_fn_like_width = 20
+bin_op_separator = Front
+chain_width = 20
+fn_call_width = 20

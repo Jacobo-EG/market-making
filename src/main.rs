@@ -1,10 +1,12 @@
-use std::{process, env, error::Error};
-use figment::{Figment, providers::{Format, Toml}};
+use figment::{
+    Figment,
+    providers::{Format, Toml},
+};
 use market_making::Config;
+use std::{env, error::Error, process};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-
     println!("Reading configuration file ...");
 
     let config_file_path = env::var("CONFIG_PATH")?;

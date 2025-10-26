@@ -1,25 +1,36 @@
-use std::{collections::HashMap, env, error::Error, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env,
+    error::Error,
+    str::FromStr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 type HmacSha512 = Hmac<Sha512>;
-use krakenrs::ws::{KrakenWsAPI, KrakenWsConfig};
 use core::f64;
 
+use futures_util::{SinkExt, StreamExt};
 use serde::{self, Deserialize};
+use serde_json::Value;
 
+use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tokio::task;
 
 //To convert the decimal type to f64
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 
 // To craft the API requests
-use reqwest::{Client, header::{HeaderMap, HeaderValue}};
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Sha512, Digest};
+use reqwest::{
+    Client,
+    header::{HeaderMap, HeaderValue},
+};
+use sha2::{Digest, Sha256, Sha512};
 
 // Used to retrieve date in YYYYMMDD format to generate the crl_ord_id
 use chrono::Utc;
 
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 // Importing the Decimal type from the rust_decimal crate
 // This type can be used for precise decimal arithmetic, especially useful in financial applications
@@ -38,11 +49,13 @@ pub struct Config {
     pub qty: u8,
     pub max_open_orders: u8,
     pub tick_size: f64,
-    pub time_to_sleep: u64
+    pub time_to_sleep: u64,
+    pub book_depth: usize,
 }
 
 // Function to calculate trading intensity
-pub fn trading_intensity<'a>(arrival_depth: &[f64], tmp: &'a mut [f64]) ->  Vec<f64> { //<'a>(arrival_depth: &[f64], tmp: &'a mut [f64]) -> &'a [f64] {
+pub fn trading_intensity<'a>(arrival_depth: &[f64], tmp: &'a mut [f64]) -> Vec<f64> {
+    //<'a>(arrival_depth: &[f64], tmp: &'a mut [f64]) -> &'a [f64] {
     let mut max_tick = 0;
 
     for depth in arrival_depth.iter() {
@@ -50,16 +63,16 @@ pub fn trading_intensity<'a>(arrival_depth: &[f64], tmp: &'a mut [f64]) ->  Vec<
             continue;
         }
 
-        let tick = (depth / 0.5) as i32 - 1 ;
+        let tick = (depth / 0.5) as i32 - 1;
 
-        if tick < 0 || tick > tmp.len() as i32{
+        if tick < 0 || tick > tmp.len() as i32 {
             continue;
         }
 
         for i in 0..tick as usize {
             tmp[i] += 1.0;
         }
-        
+
         if tick > max_tick {
             max_tick = tick;
         }
@@ -71,7 +84,9 @@ pub fn trading_intensity<'a>(arrival_depth: &[f64], tmp: &'a mut [f64]) ->  Vec<
 // Function to calculate coefficients c1 and c2 used to calculate bid and ask quote depth
 pub fn c1_c2(xi: f64, gamma: f64, delta: f64, a: f64, k: f64) -> (f64, f64) {
     let c1 = (1.0 + xi * delta / k).ln() / (xi * delta);
-    let c2 = ((gamma / (2.0 * a * delta * k)) * (1.0 + xi * delta / k).powf(k / (xi * delta) + 1.0)).sqrt();
+    let c2 = ((gamma / (2.0 * a * delta * k))
+        * (1.0 + xi * delta / k).powf(k / (xi * delta) + 1.0))
+    .sqrt();
     (c1, c2)
 }
 
@@ -104,18 +119,15 @@ fn nanstd(slice: &[f64]) -> f64 {
 
 // Auxiliary functions to send the HTTP requests to the Kraken API
 fn kraken_sign(api_path: &str, nonce: &str, post_data: &str, api_secret: &str) -> String {
-     
     let mut sha256 = Sha256::new();
     sha256.update(nonce.as_bytes());
     sha256.update(post_data.as_bytes());
     let hash = sha256.finalize();
 
-     
     let mut data = Vec::new();
     data.extend_from_slice(api_path.as_bytes());
     data.extend_from_slice(&hash);
 
-    
     let secret_decoded = general_purpose::STANDARD.decode(api_secret).unwrap();
     let mut mac = HmacSha512::new_from_slice(&secret_decoded).unwrap();
     mac.update(&data);
@@ -123,10 +135,298 @@ fn kraken_sign(api_path: &str, nonce: &str, post_data: &str, api_secret: &str) -
     general_purpose::STANDARD.encode(signature)
 }
 
-async fn kraken_add_order(client: &Client, api_key: &str, api_secret: &str, pair: &str, ordertype: &str,  volume: f64, price: f64, crl_ord_id: &str) -> Result<String, reqwest::Error> {
+#[derive(Clone, Debug)]
+struct BookLevels {
+    bids: Vec<(Decimal, Decimal)>,
+    asks: Vec<(Decimal, Decimal)>,
+}
+
+#[derive(Clone, Debug)]
+struct BookUpdate {
+    pair: String,
+    levels: BookLevels,
+}
+
+struct OrderBook {
+    depth: usize,
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
+}
+
+impl OrderBook {
+    fn new(depth: usize) -> Self {
+        Self {
+            depth,
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+        }
+    }
+
+    fn apply_snapshot(&mut self, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
+        self.bids.clear();
+        self.asks.clear();
+
+        for (price, volume) in bids {
+            if !volume.is_zero() {
+                self.bids.insert(price.clone(), volume.clone());
+            }
+        }
+        for (price, volume) in asks {
+            if !volume.is_zero() {
+                self.asks.insert(price.clone(), volume.clone());
+            }
+        }
+
+        self.trim_to_depth();
+    }
+
+    fn apply_updates(
+        &mut self,
+        bid_updates: &[(Decimal, Decimal)],
+        ask_updates: &[(Decimal, Decimal)],
+    ) {
+        for (price, volume) in bid_updates {
+            if volume.is_zero() {
+                self.bids.remove(price);
+            } else {
+                self.bids.insert(price.clone(), volume.clone());
+            }
+        }
+
+        for (price, volume) in ask_updates {
+            if volume.is_zero() {
+                self.asks.remove(price);
+            } else {
+                self.asks.insert(price.clone(), volume.clone());
+            }
+        }
+
+        self.trim_to_depth();
+    }
+
+    fn trim_to_depth(&mut self) {
+        while self.bids.len() > self.depth {
+            if let Some(key) = self.bids.iter().next().map(|(price, _)| price.clone()) {
+                self.bids.remove(&key);
+            } else {
+                break;
+            }
+        }
+
+        while self.asks.len() > self.depth {
+            if let Some(key) = self.asks.iter().next_back().map(|(price, _)| price.clone()) {
+                self.asks.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn to_levels(&self) -> BookLevels {
+        let bids = self
+            .bids
+            .iter()
+            .rev()
+            .take(self.depth)
+            .map(|(price, volume)| (price.clone(), volume.clone()))
+            .collect();
+
+        let asks = self
+            .asks
+            .iter()
+            .take(self.depth)
+            .map(|(price, volume)| (price.clone(), volume.clone()))
+            .collect();
+
+        BookLevels { bids, asks }
+    }
+}
+
+fn parse_decimal(value: &Value) -> Option<Decimal> {
+    match value {
+        Value::String(s) => Decimal::from_str(s).ok(),
+        Value::Number(num) => Decimal::from_str(&num.to_string()).ok(),
+        _ => None,
+    }
+}
+
+fn parse_levels(value: &Value) -> Vec<(Decimal, Decimal)> {
+    value
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let arr = entry.as_array()?;
+                    if arr.len() < 2 {
+                        return None;
+                    }
+                    let price = parse_decimal(&arr[0])?;
+                    let volume = parse_decimal(&arr[1])?;
+                    Some((price, volume))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn format_client_order_id(seq: u64) -> String {
+    format!("bot_{}_{}", Utc::now().format("%Y%m%d").to_string(), format!("{:05}", seq))
+}
+
+async fn stream_order_books(
+    pairs: Vec<String>,
+    depth: usize,
+    tx: mpsc::Sender<BookUpdate>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let subscribe_message = serde_json::json!({
+        "event": "subscribe",
+        "pair": pairs,
+        "subscription": {"name": "book", "depth": depth}
+    })
+    .to_string();
+
+    loop {
+        match connect_async("wss://ws.kraken.com").await {
+            Ok((ws_stream, _)) => {
+                let (mut write, mut read) = ws_stream.split();
+                write
+                    .send(Message::Text(subscribe_message.clone().into()))
+                    .await?;
+
+                let mut books: HashMap<String, OrderBook> = HashMap::new();
+
+                while let Some(message) = read.next().await {
+                    match message {
+                        Ok(Message::Text(payload)) => {
+                            let value: Value = match serde_json::from_str(&payload) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+
+                            if let Some(obj) = value.as_object() {
+                                if let Some(event) = obj.get("event").and_then(|v| v.as_str()) {
+                                    match event {
+                                        "heartbeat" => continue,
+                                        "systemStatus" => continue,
+                                        "subscriptionStatus" => {
+                                            if obj.get("status").and_then(|v| v.as_str())
+                                                != Some("subscribed")
+                                            {
+                                                tracing::warn!(?obj, "Subscription not confirmed");
+                                            }
+                                            continue;
+                                        }
+                                        _ => continue,
+                                    }
+                                }
+                            }
+
+                            let array = match value.as_array() {
+                                Some(arr) => arr,
+                                None => continue,
+                            };
+
+                            if array.len() < 4 {
+                                continue;
+                            }
+
+                            let pair = match array.last().and_then(|v| v.as_str()) {
+                                Some(p) => p.to_string(),
+                                None => continue,
+                            };
+
+                            let order_book = books
+                                .entry(pair.clone())
+                                .or_insert_with(|| OrderBook::new(depth));
+
+                            let mut snapshot_bids = Vec::new();
+                            let mut snapshot_asks = Vec::new();
+                            let mut update_bids = Vec::new();
+                            let mut update_asks = Vec::new();
+                            let mut is_snapshot = false;
+
+                            let data_entries = &array[1..array.len() - 2];
+                            for entry in data_entries {
+                                if let Some(obj) = entry.as_object() {
+                                    if let Some(asks) = obj.get("as") {
+                                        snapshot_asks = parse_levels(asks);
+                                        is_snapshot = true;
+                                    }
+                                    if let Some(bids) = obj.get("bs") {
+                                        snapshot_bids = parse_levels(bids);
+                                        is_snapshot = true;
+                                    }
+                                    if let Some(asks) = obj.get("a") {
+                                        update_asks.extend(parse_levels(asks));
+                                    }
+                                    if let Some(bids) = obj.get("b") {
+                                        update_bids.extend(parse_levels(bids));
+                                    }
+                                }
+                            }
+
+                            if is_snapshot {
+                                order_book.apply_snapshot(&snapshot_bids, &snapshot_asks);
+                            }
+
+                            if !update_bids.is_empty() || !update_asks.is_empty() {
+                                order_book.apply_updates(&update_bids, &update_asks);
+                            }
+
+                            if is_snapshot || !update_bids.is_empty() || !update_asks.is_empty() {
+                                let levels = order_book.to_levels();
+                                if tx
+                                    .send(BookUpdate {
+                                        pair: pair.clone(),
+                                        levels,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(payload)) => {
+                            write.send(Message::Pong(payload)).await?;
+                        }
+                        Ok(Message::Pong(_)) => {}
+                        Ok(Message::Close(_)) => break,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "WebSocket receive error");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to connect to Kraken WebSocket");
+            }
+        }
+
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn kraken_add_order(
+    client: &Client,
+    api_key: &str,
+    api_secret: &str,
+    pair: &str,
+    ordertype: &str,
+    volume: f64,
+    price: f64,
+    crl_ord_id: &str,
+) -> Result<String, reqwest::Error> {
     let url = "https://demo-futures.kraken.com/0/private/AddOrder";
     let api_path = "/0/private/AddOrder";
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis().to_string();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
     let mut params = HashMap::new();
 
     let price_ = price.to_string();
@@ -138,10 +438,10 @@ async fn kraken_add_order(client: &Client, api_key: &str, api_secret: &str, pair
     params.insert("ordertype", "limit");
     params.insert("price", &price_);
     params.insert("volume", &volume_);
-    params.insert("crl_ord_id", crl_ord_id);
+    params.insert("cl_ord_id", crl_ord_id);
 
     let post_data = format!(
-        "nonce={}&pair={}&type={}&ordertype=limit&price={}&volume={}&crl_ord_id={}",
+        "nonce={}&pair={}&type={}&ordertype=limit&price={}&volume={}&cl_ord_id={}",
         nonce, pair, ordertype, price_, volume_, crl_ord_id
     );
 
@@ -159,31 +459,39 @@ async fn kraken_add_order(client: &Client, api_key: &str, api_secret: &str, pair
         .await?;
 
     let text = res.text().await?;
-    
+
     Ok(text)
 }
 
 pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    // Pair to subscribe to
-    let pairs = config.pairs; // vec!["XBT/USD".to_string()];
+    let Config {
+        pairs,
+        buffer_size,
+        a: initial_a,
+        k: initial_k,
+        sigma: initial_sigma,
+        gamma,
+        delta,
+        qty,
+        max_open_orders,
+        tick_size,
+        time_to_sleep,
+        book_depth,
+    } = config;
 
-    // Create a new Kraken WebSocket API instance
-    // This will connect to the Kraken WebSocket API and subscribe to the order book for the pairs
-    let ws_config = KrakenWsConfig {
-        subscribe_book: pairs.clone(),
-        book_depth: 100,
-        private: None,
-    };
-
-    // Credentials are provided through variables
     let api_key = env::var("KRAKEN_API_KEY")?;
     let api_secret = env::var("KRAKEN_API_SECRET")?;
 
-    let api_ws = KrakenWsAPI::new(ws_config)?; 
+    let (book_tx, mut book_rx) = mpsc::channel(256);
+    tokio::spawn({
+        let subscribe_pairs = pairs.clone();
+        async move {
+            if let Err(e) = stream_order_books(subscribe_pairs, book_depth, book_tx).await {
+                tracing::error!(error = %e, "Book stream task ended");
+            }
+        }
+    });
 
-    // GLFT Market Making Model deployed online using websockets (HTTP API for orders since WS is not supported for orders in demo mode)
-    // Using circular buffers - only keep 6000 elements (10 minutes of history) instead of 10M
-    let buffer_size: usize = config.buffer_size; // 6000;
     let mut out = vec![f64::NAN; buffer_size * 5];
     let mut arrival_depth = vec![f64::NAN; buffer_size];
     let mut mid_price_chg = vec![f64::NAN; buffer_size];
@@ -191,74 +499,85 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
 
     let mut tmp = vec![f64::NAN; 3_000_000];
     let ticks: Vec<f64> = (0..tmp.len()).map(|i| i as f64 + 0.5).collect();
-    
-    let mut t = 0;
 
-    // Number of orders filled
-    let mut num_orders: u32 = 0; 
+    let mut t = 0;
+    let mut num_orders: u32 = 0;
 
     let mut prev_mid_price_tick: f64;
     let mut mid_price_tick = f64::NAN;
 
-    let mut a: f64 = config.a;
-    let mut k: f64 = config.k;
-    let mut sigma: f64 = config.sigma;
-    let gamma: f64 = config.gamma;
-    let delta: f64 = config.delta;
+    let mut a = initial_a;
+    let mut k = initial_k;
+    let mut sigma = initial_sigma;
 
-    let qty: u8 = config.qty;
-    let max_open_orders: u8 = config.max_open_orders;
-    let tick_size: f64 = config.tick_size;
+    let mut books_state: HashMap<String, BookLevels> = HashMap::new();
 
-    let time_to_sleep = config.time_to_sleep;
-
-    while t < 10_000_000 {
+    loop {
         sleep(Duration::from_millis(time_to_sleep)).await;
-        
-        // Calculate circular buffer index
+
+        loop {
+            match book_rx.try_recv() {
+                Ok(update) => {
+                    books_state.insert(update.pair, update.levels);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err("Order book stream disconnected".into());
+                }
+            }
+        }
+
         let idx = t % buffer_size;
-        
-        // Fetch the latest order book data
-        let books = task::spawn_blocking(move || api_ws.get_all_books()).await?;
 
-        for (pair, book) in books {
+        for pair in &pairs {
+            let Some(book) = books_state.get(pair) else {
+                continue;
+            };
 
-            // We start by recording market order's arrival depth from the mid-price.
-            if !mid_price_tick.is_nan(){
+            if !mid_price_tick.is_nan() {
                 let mut depth = f64::MIN;
-                for (price, _) in book.bid.iter() {
-                    depth = depth.max(price.to_f64().unwrap_or(f64::NAN) / tick_size - mid_price_tick);
+                for (price, _) in &book.bids {
+                    depth =
+                        depth.max(price.to_f64().unwrap_or(f64::NAN) / tick_size - mid_price_tick);
                 }
 
-                for (price, _) in book.ask.iter() {
-                    depth = depth.max(mid_price_tick - price.to_f64().unwrap_or(f64::NAN) / tick_size);
+                for (price, _) in &book.asks {
+                    depth =
+                        depth.max(mid_price_tick - price.to_f64().unwrap_or(f64::NAN) / tick_size);
                 }
 
-                arrival_depth[idx] = depth;   
+                arrival_depth[idx] = depth;
             }
 
             prev_mid_price_tick = mid_price_tick;
-            mid_price_tick = (book.bid.iter().next().map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN)) +
-                             book.ask.iter().next().map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN))) / 2.0;
-                
+            mid_price_tick = (book
+                .bids
+                .first()
+                .map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN))
+                + book
+                    .asks
+                    .first()
+                    .map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN)))
+                / 2.0;
+
             mid_price_chg[idx] = mid_price_tick - prev_mid_price_tick;
 
-            // Next we calculate parameters A, k and sigma every 5 seconds in a 10 minutes window
-            if t % 50 == 0 && t >= buffer_size - 1 { 
+            if t % 50 == 0 && t >= buffer_size - 1 {
                 tmp.fill(0.0);
-                
-                let mut lambda = trading_intensity(&arrival_depth, &mut tmp); 
 
-                // We take the last 70 values of lambda to calculate A and k
-                lambda = lambda.iter().take(70).map(|x| x / 600.0).collect::<Vec<f64>>();
+                let mut lambda = trading_intensity(&arrival_depth, &mut tmp);
+                lambda = lambda
+                    .iter()
+                    .take(70)
+                    .map(|x| x / 600.0)
+                    .collect::<Vec<f64>>();
 
                 let x = &ticks[..lambda.len()];
-                // Apply log to lambda to create y and y will be an array
-                let y = lambda.iter().map(|&l| l.ln()).collect::<Vec<f64>>(); 
+                let y = lambda.iter().map(|&l| l.ln()).collect::<Vec<f64>>();
                 let (k_, log_a) = linear_regression(x, &y);
 
                 a = log_a.exp();
-                k = - k_;
+                k = -k_;
 
                 sigma = nanstd(&mid_price_chg) * (10.0_f64.sqrt());
 
@@ -266,77 +585,78 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 out[idx * 5 + 3] = a;
                 out[idx * 5 + 4] = k;
             }
-            
-            // Following we calculate target bid and ask price
 
             let (c1, c2) = c1_c2(gamma, gamma, delta, a, k);
-            
+
             let half_spread = c1 + delta / 2_f64 * c2 * sigma;
             let skew = c2 * sigma;
 
             out[idx * 5 + 0] = half_spread;
             out[idx * 5 + 1] = skew;
 
-            // We use the current position to calculate the bid and ask depth
             let bid_depth = half_spread + skew * position[idx];
             let ask_depth = half_spread - skew * position[idx];
 
-            let best_bid_tick = book.bid.iter().next().map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN) / tick_size);
+            let best_bid_tick = book.bids.first().map_or(f64::NAN, |(price, _)| {
+                price.to_f64().unwrap_or(f64::NAN) / tick_size
+            });
             let bid_tick = (mid_price_tick - bid_depth).round();
-            // We previously check since the min function takes one of them directly if the other is NaN
             let mut bid_price = f64::NAN;
-            if bid_tick.is_normal() && best_bid_tick.is_normal(){
+            if bid_tick.is_normal() && best_bid_tick.is_normal() {
                 bid_price = bid_tick.min(best_bid_tick) * tick_size;
             }
 
-            let best_ask_tick = book.ask.iter().next().map_or(f64::NAN, |(price, _)| price.to_f64().unwrap_or(f64::NAN) / tick_size);
+            let best_ask_tick = book.asks.first().map_or(f64::NAN, |(price, _)| {
+                price.to_f64().unwrap_or(f64::NAN) / tick_size
+            });
             let ask_tick = (mid_price_tick + ask_depth).round();
-            // As in the bid case, we check both are not NAN
             let mut ask_price = f64::NAN;
             if ask_tick.is_normal() && best_ask_tick.is_normal() {
                 ask_price = ask_tick.max(best_ask_tick) * tick_size;
             }
 
-            // We now have everything we need to place orders
-            // Here we will have a bottleneck since orders are placed thorugh HTTP API
-            // which is slower but we have no other option in demo mode
+            if position[idx] > 0.0 && ask_price.is_normal() {
+                let client = reqwest::Client::new();
+                let crl_ord_id = format_client_order_id(num_orders as u64);
+                kraken_add_order(
+                    &client,
+                    &api_key,
+                    &api_secret,
+                    pair,
+                    "sell",
+                    qty as f64,
+                    ask_price,
+                    &crl_ord_id,
+                )
+                .await?;
 
-            // TODO: Close orders which have not been executed and are not in the prices specified
-
-            if position[idx] < max_open_orders as f64 {
-                // Place bid order if bid price is not NaN and finite
-                if bid_price.is_normal() {
-                    // Create connection to the HTTP API using krakenrs
-                    let client = reqwest::Client::new();
-                    let crl_ord_id = format!("bot_{}_{}", Utc::now().format("%Y%m%d").to_string(), format!("{:05}", num_orders));
-                    let _ = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "buy", qty as f64, bid_price, &crl_ord_id).await?;
-                   
-                    position[idx] += qty as f64;
-                    num_orders += 1;
-                }
-                if ask_price.is_normal() {
-                    // Create connection to the HTTP API using krakenrs
-                    let client = reqwest::Client::new();
-                    let crl_ord_id = format!("bot_{}_{}", Utc::now().format("%Y%m%d").to_string(), format!("{:05}", num_orders));
-                    let _ = kraken_add_order(&client, &api_key, &api_secret, &pair.clone(), "sell", qty as f64, ask_price, &crl_ord_id).await?;
-                    
-                    position[idx] -= qty as f64;
-                    num_orders += 1;
-                }
+                position[idx] -= qty as f64;
+                num_orders += 1;
             }
 
+            if position[idx] < max_open_orders as f64 && bid_price.is_normal() {
+                let client = reqwest::Client::new();
+                let crl_ord_id = format_client_order_id(num_orders as u64);
+                kraken_add_order(
+                    &client,
+                    &api_key,
+                    &api_secret,
+                    pair,
+                    "buy",
+                    qty as f64,
+                    bid_price,
+                    &crl_ord_id,
+                )
+                .await?;
+
+                position[idx] += qty as f64;
+                num_orders += 1;
+            }
         }
 
-        t+=1;
-
+        t += 1;
     }
-
-    Ok(())
-    
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-}
+mod tests {}
