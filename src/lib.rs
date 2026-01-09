@@ -271,7 +271,11 @@ fn parse_levels(value: &Value) -> Vec<(Decimal, Decimal)> {
 }
 
 fn format_client_order_id(seq: u64) -> String {
-    format!("bot_{}_{}", Utc::now().format("%Y%m%d").to_string(), format!("{:05}", seq))
+    format!(
+        "bot_{}_{}",
+        Utc::now().format("%Y%m%d").to_string(),
+        format!("{:05}", seq)
+    )
 }
 
 async fn stream_order_books(
@@ -659,4 +663,140 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nanstd_constant_values() {
+        let x = [1.0, 1.0, 1.0, 1.0];
+
+        assert_eq!(nanstd(&x), 0.0);
+    }
+
+    #[test]
+    fn nanstd_simple_case() {
+        let x = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let result = nanstd(&x);
+
+        assert!((result - 1.4142135623730951).abs() < 1e-10);
+    }
+
+    #[test]
+    fn nanstd_with_nan_values() {
+        let x = [1.0, f64::NAN, 2.0, f64::NAN, 3.0, 4.0, 5.0];
+        let expected = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let result = nanstd(&x);
+        let expected_result = nanstd(&expected);
+
+        assert!((result - expected_result).abs() < 1e-10);
+    }
+
+    #[test]
+    fn nanstd_with_infinity() {
+        let x = [1.0, 2.0, f64::INFINITY, 3.0, f64::NEG_INFINITY, 4.0];
+        let expected = [1.0, 2.0, 3.0, 4.0];
+        let result = nanstd(&x);
+        let expected_result = nanstd(&expected);
+
+        assert!((result - expected_result).abs() < 1e-10);
+    }
+
+    #[test]
+    fn nanstd_all_nan() {
+        let x = [f64::NAN, f64::NAN, f64::NAN];
+        let result = nanstd(&x);
+
+        assert!(result.is_nan());
+    }
+
+    #[test]
+    fn nanstd_empty_after_filtering() {
+        let x = [f64::INFINITY, f64::NEG_INFINITY, f64::NAN];
+        let result = nanstd(&x);
+
+        assert!(result.is_nan());
+    }
+
+    #[test]
+    fn nanstd_single_valid_value() {
+        let x = [f64::NAN, 5.0, f64::NAN];
+        let result = nanstd(&x);
+
+        assert_eq!(result, 0.0);
+    }
+
+    #[test]
+    fn nanstd_negative_values() {
+        let x = [-2.0, -1.0, 0.0, 1.0, 2.0];
+        let result = nanstd(&x);
+
+        assert!((result - 1.4142135623730951).abs() < 1e-10);
+    }
+
+    #[test]
+    fn linear_regression_perfect_line() {
+        let x = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = [5.0, 7.0, 9.0, 11.0, 13.0];
+        let (slope, intercept) = linear_regression(&x, &y);
+
+        assert!((slope - 2.0).abs() < 1e-10);
+        assert!((intercept - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn linear_regression_negative_slope() {
+        let x = [0.0, 2.0, 4.0, 6.0, 8.0];
+        let y = [10.0, 9.0, 8.0, 7.0, 6.0];
+        let (slope, intercept) = linear_regression(&x, &y);
+
+        assert!((slope - (-0.5)).abs() < 1e-10);
+        assert!((intercept - 10.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn linear_regression_horizontal_line() {
+        let x = [1.0, 2.0, 3.0, 4.0];
+        let y = [5.0, 5.0, 5.0, 5.0];
+        let (slope, intercept) = linear_regression(&x, &y);
+
+        assert!((slope - 0.0).abs() < 1e-10);
+        assert!((intercept - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn linear_regression_two_points() {
+        let x = [1.0, 2.0];
+        let y = [3.0, 5.0];
+        let (slope, intercept) = linear_regression(&x, &y);
+
+        assert!((slope - 2.0).abs() < 1e-10);
+        assert!((intercept - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn linear_regression_origin_through() {
+        let x = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let y = [0.0, 2.0, 4.0, 6.0, 8.0];
+        let (slope, intercept) = linear_regression(&x, &y);
+
+        assert!((slope - 2.0).abs() < 1e-10);
+        assert!((intercept - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn linear_regression_large_values() {
+        let x = [100.0, 200.0, 300.0, 400.0];
+        let y = [1000.0, 2000.0, 3000.0, 4000.0];
+        let (slope, intercept) = linear_regression(&x, &y);
+
+        assert!((slope - 10.0).abs() < 1e-8);
+        assert!((intercept - 0.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn nanstd_0() {
+        let x = [1.0, 1.0, 1.0, 1.0];
+
+        assert_eq!(nanstd(&x), 0_f64)
+    }
+}
