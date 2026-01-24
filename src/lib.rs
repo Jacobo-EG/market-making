@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256, Sha512};
 use chrono::Utc;
 
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tracing::instrument;
 
 // Importing the Decimal type from the rust_decimal crate
 // This type can be used for precise decimal arithmetic, especially useful in financial applications
@@ -47,10 +48,27 @@ pub struct Config {
     pub gamma: f64,
     pub delta: f64,
     pub qty: u8,
-    pub max_open_orders: u8,
+    pub max_open_pos: u8,
     pub tick_size: f64,
     pub time_to_sleep: u64,
     pub book_depth: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct BalanceResponse {
+    result: String,
+    accounts: Accounts,
+}
+
+#[derive(Debug, Deserialize)]
+struct Accounts {
+    flex: FlexAccount,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FlexAccount {
+    available_margin: f64,
 }
 
 // Function to calculate trading intensity
@@ -131,6 +149,20 @@ fn kraken_sign(api_path: &str, nonce: &str, post_data: &str, api_secret: &str) -
     let secret_decoded = general_purpose::STANDARD.decode(api_secret).unwrap();
     let mut mac = HmacSha512::new_from_slice(&secret_decoded).unwrap();
     mac.update(&data);
+    let signature = mac.finalize().into_bytes();
+    general_purpose::STANDARD.encode(signature)
+}
+
+fn kraken_futures_sign(path: &str, data: &str, nonce: &str, api_secret: &str) -> String {
+    let path_without_derivatives = path.strip_prefix("/derivatives").unwrap_or(path);
+    
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}{}{}", data, nonce, path_without_derivatives).as_bytes());
+    let hash_result = hasher.finalize();
+    
+    let secret_decoded = general_purpose::STANDARD.decode(api_secret).unwrap();
+    let mut mac = HmacSha512::new_from_slice(&secret_decoded).unwrap();
+    mac.update(&hash_result);
     let signature = mac.finalize().into_bytes();
     general_purpose::STANDARD.encode(signature)
 }
@@ -398,7 +430,7 @@ async fn stream_order_books(
                         Ok(Message::Pong(_)) => {}
                         Ok(Message::Close(_)) => break,
                         Err(e) => {
-                            tracing::warn!(error = %e, "WebSocket receive error");
+                            tracing::warn!(?e, "WebSocket receive error");
                             break;
                         }
                         _ => {}
@@ -406,7 +438,7 @@ async fn stream_order_books(
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "Failed to connect to Kraken WebSocket");
+                tracing::error!(?e, "Failed to connect to Kraken WebSocket");
             }
         }
 
@@ -414,60 +446,109 @@ async fn stream_order_books(
     }
 }
 
+fn get_nonce() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string()
+}
+
+#[instrument]
 async fn kraken_add_order(
     client: &Client,
     api_key: &str,
     api_secret: &str,
-    pair: &str,
-    ordertype: &str,
-    volume: f64,
-    price: f64,
-    crl_ord_id: &str,
+    symbol: &str,
+    side: &str,
+    size: f64,
+    limit_price: f64,
+    cli_ord_id: &str,
 ) -> Result<String, reqwest::Error> {
-    let url = "https://demo-futures.kraken.com/0/private/AddOrder";
-    let api_path = "/0/private/AddOrder";
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .to_string();
-    let mut params = HashMap::new();
-
-    let price_ = price.to_string();
-    let volume_ = volume.to_string();
-
-    params.insert("nonce", nonce.as_str());
-    params.insert("pair", pair);
-    params.insert("type", ordertype);
-    params.insert("ordertype", "limit");
-    params.insert("price", &price_);
-    params.insert("volume", &volume_);
-    params.insert("cl_ord_id", crl_ord_id);
-
-    let post_data = format!(
-        "nonce={}&pair={}&type={}&ordertype=limit&price={}&volume={}&cl_ord_id={}",
-        nonce, pair, ordertype, price_, volume_, crl_ord_id
+    let url = "https://demo-futures.kraken.com/derivatives/api/v3/sendorder";
+    let path = "/derivatives/api/v3/sendorder";
+    let nonce = get_nonce();
+    
+    // Body para POST en formato URL-encoded
+    let body_data = format!(
+        "orderType=lmt&symbol={}&side={}&size={}&limitPrice={}&cliOrdId={}",
+        symbol, side, size, limit_price, cli_ord_id
     );
-
-    let api_sign = kraken_sign(api_path, &nonce, &post_data, api_secret);
+    
+    let authent = kraken_futures_sign(path, &body_data, &nonce, api_secret);
 
     let mut headers = HeaderMap::new();
-    headers.insert("API-Key", HeaderValue::from_str(api_key).unwrap());
-    headers.insert("API-Sign", HeaderValue::from_str(&api_sign).unwrap());
+    headers.insert("APIKey", HeaderValue::from_str(api_key).unwrap());
+    headers.insert("Nonce", HeaderValue::from_str(&nonce).unwrap());
+    headers.insert("Authent", HeaderValue::from_str(&authent).unwrap());
+    headers.insert("Content-Type", HeaderValue::from_static("application/x-www-form-urlencoded"));
 
     let res = client
         .post(url)
         .headers(headers)
-        .form(&params)
+        .body(body_data)
         .send()
         .await?;
 
     let text = res.text().await?;
-
     Ok(text)
 }
 
-pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
+async fn get_balance(
+    client: &Client,
+    api_key: &str,
+    api_secret: &str,
+) -> Result<f64, Box<dyn Error>> {
+    let url = "https://demo-futures.kraken.com/derivatives/api/v3/accounts";
+    let path = "/derivatives/api/v3/accounts";
+    let nonce = get_nonce();
+    let data = ""; 
+    
+    let authent = kraken_futures_sign(path, data, &nonce, api_secret);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("APIKey", HeaderValue::from_str(api_key).unwrap());
+    headers.insert("Nonce", HeaderValue::from_str(&nonce).unwrap());
+    headers.insert("Authent", HeaderValue::from_str(&authent).unwrap());
+
+    let res = client
+        .get(url)
+        .headers(headers)
+        .send()
+        .await?;
+
+    let balance_response: BalanceResponse = res.json().await?;
+    Ok(balance_response.accounts.flex.available_margin)
+}
+
+async fn get_open_orders(
+    client: &Client,
+    api_key: &str,
+    api_secret: &str,
+) -> Result<String, Box<dyn Error>> {
+    let url = "https://demo-futures.kraken.com/derivatives/api/v3/openorders";
+    let path = "/derivatives/api/v3/openorders";
+    let nonce = get_nonce();
+    let data = ""; // Sin query ni body para GET
+    
+    let authent = kraken_futures_sign(path, data, &nonce, api_secret);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("APIKey", HeaderValue::from_str(api_key).unwrap());
+    headers.insert("Nonce", HeaderValue::from_str(&nonce).unwrap());
+    headers.insert("Authent", HeaderValue::from_str(&authent).unwrap());
+
+    let res = client
+        .get(url)
+        .headers(headers)
+        .send()
+        .await?;
+
+    let text = res.text().await?;
+    Ok(text)
+}
+
+pub async fn run(config: Config, api_key: &str, api_secret: &str) -> Result<(), Box<dyn Error>> {
     let Config {
         pairs,
         buffer_size,
@@ -477,14 +558,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         gamma,
         delta,
         qty,
-        max_open_orders,
+        max_open_pos,
         tick_size,
         time_to_sleep,
         book_depth,
     } = config;
-
-    let api_key = env::var("KRAKEN_API_KEY")?;
-    let api_secret = env::var("KRAKEN_API_SECRET")?;
 
     let (book_tx, mut book_rx) = mpsc::channel(256);
     tokio::spawn({
@@ -534,6 +612,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         let idx = t % buffer_size;
 
         for pair in &pairs {
+            let client = reqwest::Client::new();
+            let balance = get_balance(&client, &api_key, &api_secret);
+
             let Some(book) = books_state.get(pair) else {
                 continue;
             };
@@ -620,7 +701,6 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             }
 
             if position[idx] > 0.0 && ask_price.is_normal() {
-                let client = reqwest::Client::new();
                 let crl_ord_id = format_client_order_id(num_orders as u64);
                 kraken_add_order(
                     &client,
@@ -638,8 +718,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 num_orders += 1;
             }
 
-            if position[idx] < max_open_orders as f64 && bid_price.is_normal() {
-                let client = reqwest::Client::new();
+            if position[idx] < max_open_pos as f64 && bid_price.is_normal() && balance.await? >= bid_price*(qty as f64) {
                 let crl_ord_id = format_client_order_id(num_orders as u64);
                 kraken_add_order(
                     &client,
