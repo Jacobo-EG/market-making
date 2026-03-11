@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    env,
     error::Error,
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -56,7 +55,7 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 struct BalanceResponse {
-    result: String,
+    _result: String,
     accounts: Accounts,
 }
 
@@ -133,24 +132,6 @@ fn nanstd(slice: &[f64]) -> f64 {
     let mean = valid.iter().sum::<f64>() / n;
     let var = valid.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
     var.sqrt()
-}
-
-// Auxiliary functions to send the HTTP requests to the Kraken API
-fn kraken_sign(api_path: &str, nonce: &str, post_data: &str, api_secret: &str) -> String {
-    let mut sha256 = Sha256::new();
-    sha256.update(nonce.as_bytes());
-    sha256.update(post_data.as_bytes());
-    let hash = sha256.finalize();
-
-    let mut data = Vec::new();
-    data.extend_from_slice(api_path.as_bytes());
-    data.extend_from_slice(&hash);
-
-    let secret_decoded = general_purpose::STANDARD.decode(api_secret).unwrap();
-    let mut mac = HmacSha512::new_from_slice(&secret_decoded).unwrap();
-    mac.update(&data);
-    let signature = mac.finalize().into_bytes();
-    general_purpose::STANDARD.encode(signature)
 }
 
 fn kraken_futures_sign(path: &str, data: &str, nonce: &str, api_secret: &str) -> String {
@@ -521,7 +502,13 @@ async fn get_balance(
     Ok(balance_response.accounts.flex.available_margin)
 }
 
-async fn get_open_orders(
+// Not dead work but functionalities I am are currently working on
+async fn _manage_placed_orders(client: &Client, api_key: &str, api_secret: &str) {
+    let _open_orders = _get_open_orders(client, api_key, api_secret).await;
+}
+
+// Not dead work but functionalities I am are currently working on
+async fn _get_open_orders(
     client: &Client,
     api_key: &str,
     api_secret: &str,
